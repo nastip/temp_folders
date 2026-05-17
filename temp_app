@@ -1,0 +1,105 @@
+import threading
+
+
+    def refresh_available_files(self, source_name: str | None = None, notify_on_access_failure: bool = False) -> None:
+        source_name = source_name or self.current_source_name
+        token = self._access_request_tokens.get(source_name, 0) + 1
+        self._access_request_tokens[source_name] = token
+        source_dir = self.current_config_source_dir(source_name)
+        file_combo = self.source_widget(source_name, "file_combo")
+        save_button = self.source_widget(source_name, "save_button")
+        access_status_label = self.source_widget(source_name, "access_status_label")
+
+        access_status_label.setText("Checking...")
+        file_combo.blockSignals(True)
+        file_combo.clear()
+        file_combo.blockSignals(False)
+        file_combo.setEnabled(False)
+        save_button.setEnabled(False)
+
+        if source_name == self.current_source_name:
+            self.current_file_name = None
+            self.current_file_path = None
+            self.editor_stack.setCurrentWidget(self.unavailable_page)
+            self.unavailable_page.setText(
+                "Checking remote configuration folder.\n\n"
+                f"Source: {source_name}\n"
+                f"Path: {source_dir}"
+            )
+            self.set_banner(f"{source_name}: checking remote access...", "info")
+            self.emit_status(f"Checking {source_name} configuration path")
+
+        threading.Thread(
+            target=self._probe_available_files,
+            args=(source_name, token, notify_on_access_failure),
+            daemon=True,
+        ).start()
+
+    def _probe_available_files(self, source_name: str, token: int, notify_on_access_failure: bool) -> None:
+        source_dir = self.current_config_source_dir(source_name)
+        access_ok, message = self.check_remote_access(source_name)
+        available_files: list[str] = []
+        if access_ok:
+            etl_config_path = source_dir / ETL_CONFIG_FILE
+            if etl_config_path.is_file():
+                available_files = [ETL_CONFIG_FILE]
+            else:
+                available_files = [
+                    file_name
+                    for file_name in LEGACY_MANAGED_JSON_FILES
+                    if (source_dir / file_name).is_file()
+                ]
+
+        self.access_check_finished.emit(
+            {
+                "source_name": source_name,
+                "source_dir": source_dir,
+                "token": token,
+                "notify_on_access_failure": notify_on_access_failure,
+                "access_ok": access_ok,
+                "message": message,
+                "available_files": available_files,
+            }
+        )
+
+    def _apply_access_check_result(self, result: object) -> None:
+        payload = dict(result) if isinstance(result, dict) else {}
+        source_name = str(payload.get("source_name", ""))
+        if not source_name:
+            return
+        if payload.get("token") != self._access_request_tokens.get(source_name):
+            return
+
+        source_dir = Path(payload["source_dir"])
+        notify_on_access_failure = bool(payload.get("notify_on_access_failure", False))
+        access_ok = bool(payload.get("access_ok", False))
+        message = str(payload.get("message", ""))
+        available_files = [str(item) for item in payload.get("available_files", [])]
+
+        file_combo = self.source_widget(source_name, "file_combo")
+        save_button = self.source_widget(source_name, "save_button")
+        access_status_label = self.source_widget(source_name, "access_status_label")
+        access_status_label.setText(message)
+
+        if not access_ok:
+            file_combo.blockSignals(True)
+            file_combo.clear()
+            file_combo.blockSignals(False)
+            file_combo.setEnabled(False)
+            save_button.setEnabled(False)
+            self.selected_file_by_source.pop(source_name, None)
+            if source_name == self.current_source_name:
+                self.current_file_name = None
+                self.current_file_path = None
+                self.editor_stack.setCurrentWidget(self.unavailable_page)
+                self.unavailable_page.setText(
+                    "Cannot access the remote configuration folder.\n\n"
+                    f"Source: {source_name}\n"
+                    f"Path: {source_dir}\n\n"
+                    f"Details: {message}"
+                )
+                self.set_banner(f"{source_name}: {message}", "error")
+                self.emit_status(f"{source_name} configuration path unavailable")
+            if notify_on_access_failure:
+                QMessageBox.warning(self, "Remote access unavailable", message)
+            return
